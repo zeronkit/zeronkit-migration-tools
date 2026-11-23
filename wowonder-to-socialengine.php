@@ -1,7 +1,7 @@
 <?php
 /**
  * ZeronKit: WoWonder to SocialEngine Migration Tool
- * Version: 2.0
+ * Version: 2.1
  * Website: https://zeronkit.com
  *
  * Copyright (C) ZeronKit, https://zeronkit.com
@@ -41,7 +41,7 @@
  *  SUPPORT: contact@zeronkit.com
  */
 
-define('ZERONKIT_VERSION', '2.0');
+define('ZERONKIT_VERSION', '2.1');
 define('ZERONKIT_SITE', 'https://zeronkit.com');
 define('ZERONKIT_TARGET', 'socialengine');
 
@@ -81,6 +81,36 @@ function zk_out($msg, $class = '') {
 function zk_esc($db, $v) { return $db->real_escape_string($v ?? ''); }
 function zk_ts($ts) { $t = (int)$ts; return $t > 0 ? date('Y-m-d H:i:s', $t) : date('Y-m-d H:i:s'); }
 
+// Run one write query. A failing row is reported and skipped, the run goes on. Returns the rows really written.
+function zk_q($db, $sql) {
+    global $zk_failed;
+    if ($db->query($sql)) return max(0, $db->affected_rows);
+    $zk_failed = (int)$zk_failed + 1;
+    if ($zk_failed <= 50) zk_out("  Skipped, database error: " . htmlspecialchars($db->error), 'warn');
+    elseif ($zk_failed == 51) zk_out("  More database errors: only the first 50 are shown", 'warn');
+    return 0;
+}
+
+// Read source rows. A missing table or column is reported and gives no rows instead of a fatal error.
+function zk_rows($db, $sql) {
+    $r = $db->query($sql);
+    if (!$r) { zk_out("  Could not read from WoWonder: " . htmlspecialchars($db->error) . " (skipped)", 'warn'); return; }
+    while ($row = $r->fetch_assoc()) yield $row;
+    $r->free();
+}
+
+// Open a database connection. Returns null and prints a clear message when the login fails.
+function zk_connect($cfg, $name) {
+    $db = @new mysqli($cfg['host'], $cfg['user'], $cfg['pass'], $cfg['db'], $cfg['port']);
+    if ($db->connect_error) {
+        zk_out("$name database connection failed: " . htmlspecialchars($db->connect_error), 'err');
+        zk_out("Nothing was changed. Check the $name host, port, username, password and database name, then try again.", 'err');
+        return null;
+    }
+    $db->set_charset('utf8mb4');
+    return $db;
+}
+
 function zk_fix_text($text, $hashtags, $usernames) {
     $text = preg_replace_callback('/#\[(\d+)\]/', function($m) use ($hashtags) {
         return isset($hashtags[$m[1]]) ? '#' . $hashtags[$m[1]] : $m[0];
@@ -101,14 +131,15 @@ function zk_fix_text($text, $hashtags, $usernames) {
 function zk_run_migration($_MIGRATION_STEPS, $_WO_CONFIG, $_SE_CONFIG) {
     set_time_limit(0);
     ini_set('memory_limit', '2G');
+    // PHP 8.1+ turns every mysqli error into a fatal exception; every result is checked below instead.
+    mysqli_report(MYSQLI_REPORT_OFF);
+    global $zk_failed;
+    $zk_failed = 0;
 
-    $wo = new mysqli($_WO_CONFIG['host'], $_WO_CONFIG['user'], $_WO_CONFIG['pass'], $_WO_CONFIG['db'], $_WO_CONFIG['port']);
-    if ($wo->connect_error) { zk_out("WoWonder DB failed: " . $wo->connect_error, 'err'); return; }
-    $wo->set_charset('utf8mb4');
-
-    $se = new mysqli($_SE_CONFIG['host'], $_SE_CONFIG['user'], $_SE_CONFIG['pass'], $_SE_CONFIG['db'], $_SE_CONFIG['port']);
-    if ($se->connect_error) { zk_out("SocialEngine DB failed: " . $se->connect_error, 'err'); return; }
-    $se->set_charset('utf8mb4');
+    $wo = zk_connect($_WO_CONFIG, 'WoWonder');
+    if (!$wo) return;
+    $se = zk_connect($_SE_CONFIG, 'SocialEngine');
+    if (!$se) return;
 
     zk_out("Connected to both databases", 'ok');
     zk_out("");
@@ -122,25 +153,48 @@ function zk_run_migration($_MIGRATION_STEPS, $_WO_CONFIG, $_SE_CONFIG) {
     // Preload
     zk_out("Loading lookup tables...", 'info');
     $hashtags = [];
-    $r = $wo->query("SELECT id, tag FROM Wo_Hashtags");
-    while ($row = $r->fetch_assoc()) $hashtags[$row['id']] = $row['tag'];
+    foreach (zk_rows($wo, "SELECT id, tag FROM Wo_Hashtags") as $row) $hashtags[$row['id']] = $row['tag'];
     $usernames = [];
-    $r = $wo->query("SELECT user_id, username FROM Wo_Users");
-    while ($row = $r->fetch_assoc()) $usernames[$row['user_id']] = $row['username'];
+    foreach (zk_rows($wo, "SELECT user_id, username FROM Wo_Users") as $row) $usernames[$row['user_id']] = $row['username'];
     zk_out("  Loaded " . count($hashtags) . " hashtags, " . count($usernames) . " usernames", 'ok');
     zk_out("");
 
     $post_map = [];
+    // True when both user ids exist in SocialEngine.
+    $both = function ($a, $b) use ($se) {
+        $r = $se->query("SELECT COUNT(*) as c FROM engine4_users WHERE user_id IN ($a,$b)");
+        return $r && $r->fetch_assoc()['c'] >= 2;
+    };
+    $exists = function ($id) use ($se) {
+        $r = $se->query("SELECT 1 FROM engine4_users WHERE user_id = $id");
+        return $r && $r->num_rows > 0;
+    };
+
+    // The SocialEngine admin keeps id 1. WoWonder user 1 gets the first id after the last WoWonder user,
+    // and $U() moves every reference to WoWonder user 1 along with it.
+    $u1 = 1;
+    $U = function ($id) use (&$u1) { $id = (int)$id; return $id === 1 ? $u1 : $id; };
 
     // ====== USERS ======
     if (in_array('users', $_MIGRATION_STEPS)) {
         $step_num++;
         zk_out("[$step_num/$total_steps] Migrating Users...", 'info');
-        $se->query("DELETE FROM engine4_users WHERE user_id > 1");
-        $result = $wo->query("SELECT * FROM Wo_Users ORDER BY user_id ASC");
+        zk_q($se, "DELETE FROM engine4_users WHERE user_id > 1");
         $c = 0;
-        while ($u = $result->fetch_assoc()) {
-            if ($u['user_id'] == 1) continue;
+        foreach (zk_rows($wo, "SELECT * FROM Wo_Users ORDER BY user_id ASC") as $u) {
+            $id = (int)$u['user_id'];
+            if ($id === 1) {
+                $name = htmlspecialchars($u['username']);
+                $dup = $se->query("SELECT user_id FROM engine4_users WHERE username='" . zk_esc($se,$u['username']) . "' OR email='" . zk_esc($se,$u['email']) . "' LIMIT 1");
+                if ($dup && $dup->num_rows) {
+                    $stats['WoWonder user 1'] = "same as SocialEngine admin, merged into id 1";
+                    zk_out("  WoWonder user 1 ($name) has the same username or email as the SocialEngine admin: no second account was made, its content now belongs to the admin (id 1). The admin login is unchanged.", 'warn');
+                    continue;
+                }
+                $u1 = $id = max(array_keys($usernames)) + 1;
+                $stats['WoWonder user 1'] = "moved to id $id";
+                zk_out("  WoWonder user 1 ($name) is migrated as user id $id, because id 1 is the SocialEngine admin (left unchanged).", 'warn');
+            }
             $username = zk_esc($se, $u['username']);
             $email = zk_esc($se, $u['email']);
             $password = zk_esc($se, $u['password']);
@@ -159,8 +213,8 @@ function zk_run_migration($_MIGRATION_STEPS, $_WO_CONFIG, $_SE_CONFIG) {
             $status = zk_esc($se, $u['about'] ?? '');
             $time = zk_ts($u['joined'] ?? 0);
 
-            $sql = "INSERT INTO engine4_users (user_id,email,username,displayname,firstname,lastname,dob,gender,password,salt,status,level_id,enabled,approved,verified,creation_date,modified_date,creation_ip) VALUES ({$u['user_id']},'$email','$username','$displayname','$firstname','$lastname',$dob,'$gender','$password','','$status',$level,$enabled,1,$verified,'$time','$time',INET6_ATON('127.0.0.1')) ON DUPLICATE KEY UPDATE username=VALUES(username)";
-            if ($se->query($sql)) $c++;
+            $sql = "INSERT INTO engine4_users (user_id,email,username,displayname,firstname,lastname,dob,gender,password,salt,status,level_id,enabled,approved,verified,creation_date,modified_date,creation_ip) VALUES ($id,'$email','$username','$displayname','$firstname','$lastname',$dob,'$gender','$password','','$status',$level,$enabled,1,$verified,'$time','$time',INET6_ATON('127.0.0.1'))";
+            $c += zk_q($se, $sql);
         }
         $stats['Users'] = $c;
         zk_out("  $c users migrated", 'ok');
@@ -170,14 +224,12 @@ function zk_run_migration($_MIGRATION_STEPS, $_WO_CONFIG, $_SE_CONFIG) {
     if (in_array('followers', $_MIGRATION_STEPS)) {
         $step_num++;
         zk_out("[$step_num/$total_steps] Migrating Follows...", 'info');
-        $se->query("TRUNCATE TABLE engine4_user_follows");
-        $result = $wo->query("SELECT * FROM Wo_Followers WHERE active = 1");
+        zk_q($se, "TRUNCATE TABLE engine4_user_follows");
         $c = 0;
-        while ($f = $result->fetch_assoc()) {
-            $a = (int)$f['follower_id']; $b = (int)$f['following_id'];
-            $check = $se->query("SELECT COUNT(*) as c FROM engine4_users WHERE user_id IN ($a,$b)");
-            if ($check->fetch_assoc()['c'] < 2) continue;
-            if ($se->query("INSERT IGNORE INTO engine4_user_follows (user_id,resource_id,resource_approved,user_approved,creation_date) VALUES ($a,$b,1,1,'".zk_ts($f['time'])."')")) $c++;
+        foreach (zk_rows($wo, "SELECT * FROM Wo_Followers WHERE active = 1") as $f) {
+            $a = $U($f['follower_id']); $b = $U($f['following_id']);
+            if (!$both($a, $b)) continue;
+            $c += zk_q($se, "INSERT IGNORE INTO engine4_user_follows (user_id,resource_id,resource_approved,user_approved,creation_date) VALUES ($a,$b,1,1,'".zk_ts($f['time'])."')");
         }
         $stats['Follows'] = $c;
         zk_out("  $c follows migrated", 'ok');
@@ -187,23 +239,22 @@ function zk_run_migration($_MIGRATION_STEPS, $_WO_CONFIG, $_SE_CONFIG) {
     if (in_array('posts', $_MIGRATION_STEPS)) {
         $step_num++;
         zk_out("[$step_num/$total_steps] Migrating Posts...", 'info');
-        $se->query("DELETE FROM engine4_activity_actions WHERE action_id > 0");
-        $se->query("TRUNCATE TABLE engine4_activity_stream");
-        $result = $wo->query("SELECT * FROM Wo_Posts WHERE user_id > 0 ORDER BY id ASC");
+        zk_q($se, "DELETE FROM engine4_activity_actions WHERE action_id > 0");
+        zk_q($se, "TRUNCATE TABLE engine4_activity_stream");
         $c = 0;
-        while ($p = $result->fetch_assoc()) {
-            $uid = (int)$p['user_id'];
-            $check = $se->query("SELECT 1 FROM engine4_users WHERE user_id = $uid");
-            if (!$check || $check->num_rows == 0) continue;
+        foreach (zk_rows($wo, "SELECT * FROM Wo_Posts WHERE user_id > 0 ORDER BY id ASC") as $p) {
+            $pid = (int)$p['id'];
+            $uid = $U($p['user_id']);
+            if (!$exists($uid)) continue;
             $text = zk_esc($se, zk_fix_text($p['postText'] ?: '', $hashtags, $usernames));
             $time = zk_ts($p['time']);
             $privacy = 'everyone';
             if ($p['postPrivacy'] == '2') $privacy = 'friends';
             elseif ($p['postPrivacy'] == '3') $privacy = 'self';
-            if ($se->query("INSERT INTO engine4_activity_actions (action_id,type,subject_type,subject_id,object_type,object_id,body,date,modified_date,privacy,attachment_count,comment_count,like_count,share_count) VALUES ({$p['id']},'status','user',$uid,'user',$uid,'$text','$time','$time','$privacy',0,0,0,0)")) {
-                $post_map[$p['id']] = $p['id'];
+            if (zk_q($se, "INSERT INTO engine4_activity_actions (action_id,type,subject_type,subject_id,object_type,object_id,body,date,modified_date,privacy,attachment_count,comment_count,like_count,share_count) VALUES ($pid,'status','user',$uid,'user',$uid,'$text','$time','$time','$privacy',0,0,0,0)")) {
+                $post_map[$pid] = $pid;
                 $c++;
-                $se->query("INSERT IGNORE INTO engine4_activity_stream (target_type,target_id,subject_type,subject_id,object_type,object_id,type,action_id) VALUES ('user',$uid,'user',$uid,'user',$uid,'status',{$p['id']})");
+                zk_q($se, "INSERT IGNORE INTO engine4_activity_stream (target_type,target_id,subject_type,subject_id,object_type,object_id,type,action_id) VALUES ('user',$uid,'user',$uid,'user',$uid,'status',$pid)");
             }
         }
         $stats['Posts'] = $c;
@@ -214,20 +265,18 @@ function zk_run_migration($_MIGRATION_STEPS, $_WO_CONFIG, $_SE_CONFIG) {
     if (in_array('reactions', $_MIGRATION_STEPS)) {
         $step_num++;
         zk_out("[$step_num/$total_steps] Migrating Likes...", 'info');
-        $se->query("TRUNCATE TABLE engine4_activity_likes");
-        $result = $wo->query("SELECT DISTINCT post_id, user_id FROM Wo_Reactions WHERE post_id > 0");
+        zk_q($se, "TRUNCATE TABLE engine4_activity_likes");
         $c = 0; $counts = [];
-        while ($r = $result->fetch_assoc()) {
-            $pid = (int)$r['post_id']; $uid = (int)$r['user_id'];
+        foreach (zk_rows($wo, "SELECT DISTINCT post_id, user_id FROM Wo_Reactions WHERE post_id > 0") as $r) {
+            $pid = (int)$r['post_id']; $uid = $U($r['user_id']);
             if (!isset($post_map[$pid])) continue;
-            $check = $se->query("SELECT 1 FROM engine4_users WHERE user_id = $uid");
-            if (!$check || $check->num_rows == 0) continue;
-            if ($se->query("INSERT IGNORE INTO engine4_activity_likes (resource_id,poster_type,poster_id) VALUES ($pid,'user',$uid)")) {
+            if (!$exists($uid)) continue;
+            if (zk_q($se, "INSERT IGNORE INTO engine4_activity_likes (resource_id,poster_type,poster_id) VALUES ($pid,'user',$uid)")) {
                 $c++;
                 $counts[$pid] = ($counts[$pid] ?? 0) + 1;
             }
         }
-        foreach ($counts as $pid => $cc) $se->query("UPDATE engine4_activity_actions SET like_count = $cc WHERE action_id = $pid");
+        foreach ($counts as $pid => $cc) zk_q($se, "UPDATE engine4_activity_actions SET like_count = $cc WHERE action_id = $pid");
         $stats['Likes'] = $c;
         zk_out("  $c likes migrated", 'ok');
     }
@@ -236,22 +285,20 @@ function zk_run_migration($_MIGRATION_STEPS, $_WO_CONFIG, $_SE_CONFIG) {
     if (in_array('comments', $_MIGRATION_STEPS)) {
         $step_num++;
         zk_out("[$step_num/$total_steps] Migrating Comments...", 'info');
-        $se->query("DELETE FROM engine4_activity_comments WHERE comment_id > 0");
-        $result = $wo->query("SELECT * FROM Wo_Comments ORDER BY id ASC");
+        zk_q($se, "DELETE FROM engine4_activity_comments WHERE comment_id > 0");
         $c = 0; $counts = [];
-        while ($co = $result->fetch_assoc()) {
-            $pid = (int)$co['post_id']; $uid = (int)$co['user_id'];
+        foreach (zk_rows($wo, "SELECT * FROM Wo_Comments ORDER BY id ASC") as $co) {
+            $pid = (int)$co['post_id']; $uid = $U($co['user_id']);
             if (!isset($post_map[$pid])) continue;
-            $check = $se->query("SELECT 1 FROM engine4_users WHERE user_id = $uid");
-            if (!$check || $check->num_rows == 0) continue;
+            if (!$exists($uid)) continue;
             $body = zk_esc($se, zk_fix_text($co['text'] ?: '', $hashtags, $usernames));
             $time = zk_ts($co['time']);
-            if ($se->query("INSERT INTO engine4_activity_comments (comment_id,resource_id,poster_type,poster_id,body,creation_date,like_count) VALUES ({$co['id']},$pid,'user',$uid,'$body','$time',0)")) {
+            if (zk_q($se, "INSERT INTO engine4_activity_comments (comment_id,resource_id,poster_type,poster_id,body,creation_date,like_count) VALUES (".(int)$co['id'].",$pid,'user',$uid,'$body','$time',0)")) {
                 $c++;
                 $counts[$pid] = ($counts[$pid] ?? 0) + 1;
             }
         }
-        foreach ($counts as $pid => $cc) $se->query("UPDATE engine4_activity_actions SET comment_count = $cc WHERE action_id = $pid");
+        foreach ($counts as $pid => $cc) zk_q($se, "UPDATE engine4_activity_actions SET comment_count = $cc WHERE action_id = $pid");
         $stats['Comments'] = $c;
         zk_out("  $c comments migrated", 'ok');
     }
@@ -260,47 +307,54 @@ function zk_run_migration($_MIGRATION_STEPS, $_WO_CONFIG, $_SE_CONFIG) {
     if (in_array('messages', $_MIGRATION_STEPS)) {
         $step_num++;
         zk_out("[$step_num/$total_steps] Migrating Messages...", 'info');
-        $se->query("TRUNCATE TABLE engine4_messages_messages");
-        $se->query("TRUNCATE TABLE engine4_messages_conversations");
-        $se->query("TRUNCATE TABLE engine4_messages_recipients");
-        $result = $wo->query("SELECT DISTINCT LEAST(from_id,to_id) as u1, GREATEST(from_id,to_id) as u2 FROM Wo_Messages WHERE to_id>0 AND from_id>0 AND group_id=0 AND page_id=0");
-        $cmap = []; $cid = 0;
-        while ($pair = $result->fetch_assoc()) {
-            $u1 = (int)$pair['u1']; $u2 = (int)$pair['u2'];
-            $check = $se->query("SELECT COUNT(*) as c FROM engine4_users WHERE user_id IN ($u1,$u2)");
-            if ($check->fetch_assoc()['c'] < 2) continue;
+        zk_q($se, "TRUNCATE TABLE engine4_messages_messages");
+        zk_q($se, "TRUNCATE TABLE engine4_messages_conversations");
+        zk_q($se, "TRUNCATE TABLE engine4_messages_recipients");
+        $cmap = []; $cid = 0; $cc = 0;
+        foreach (zk_rows($wo, "SELECT DISTINCT LEAST(from_id,to_id) as u1, GREATEST(from_id,to_id) as u2 FROM Wo_Messages WHERE to_id>0 AND from_id>0 AND group_id=0 AND page_id=0") as $pair) {
+            $a = $U($pair['u1']); $b = $U($pair['u2']);
+            $u_1 = min($a, $b); $u_2 = max($a, $b);
+            if (!$both($u_1, $u_2)) continue;
             $cid++;
-            $cmap["$u1-$u2"] = $cid;
-            $se->query("INSERT INTO engine4_messages_conversations (conversation_id,title,user_id,recipients,modified,locked) VALUES ($cid,'',$u1,2,NOW(),0)");
-            $se->query("INSERT IGNORE INTO engine4_messages_recipients (user_id,conversation_id,inbox_updated,inbox_read,inbox_deleted,outbox_deleted) VALUES ($u1,$cid,NOW(),1,0,0)");
-            $se->query("INSERT IGNORE INTO engine4_messages_recipients (user_id,conversation_id,inbox_updated,inbox_read,inbox_deleted,outbox_deleted) VALUES ($u2,$cid,NOW(),1,0,0)");
+            $cmap["$u_1-$u_2"] = $cid;
+            // NOW() is replaced below by the time of the last message.
+            $cc += zk_q($se, "INSERT INTO engine4_messages_conversations (conversation_id,title,user_id,recipients,modified,locked) VALUES ($cid,'',$u_1,2,NOW(),0)");
+            zk_q($se, "INSERT IGNORE INTO engine4_messages_recipients (user_id,conversation_id,inbox_updated,inbox_read,inbox_deleted,outbox_deleted) VALUES ($u_1,$cid,NOW(),1,0,0)");
+            zk_q($se, "INSERT IGNORE INTO engine4_messages_recipients (user_id,conversation_id,inbox_updated,inbox_read,inbox_deleted,outbox_deleted) VALUES ($u_2,$cid,NOW(),1,0,0)");
         }
-        $result = $wo->query("SELECT * FROM Wo_Messages WHERE to_id>0 AND from_id>0 AND group_id=0 AND page_id=0 ORDER BY id ASC");
-        $mc = 0;
-        while ($m = $result->fetch_assoc()) {
-            $k = min($m['from_id'],$m['to_id']).'-'.max($m['from_id'],$m['to_id']);
+        $mc = 0; $last = [];
+        foreach (zk_rows($wo, "SELECT * FROM Wo_Messages WHERE to_id>0 AND from_id>0 AND group_id=0 AND page_id=0 ORDER BY id ASC") as $m) {
+            $from = $U($m['from_id']); $to = $U($m['to_id']);
+            $k = min($from,$to).'-'.max($from,$to);
             if (!isset($cmap[$k])) continue;
             $body = zk_esc($se, zk_fix_text($m['text'] ?: '', $hashtags, $usernames));
-            if ($se->query("INSERT INTO engine4_messages_messages (conversation_id,user_id,title,body,date) VALUES ({$cmap[$k]},{$m['from_id']},'','$body','".zk_ts($m['time'])."')")) $mc++;
+            $t = (int)$m['time'];
+            if (zk_q($se, "INSERT INTO engine4_messages_messages (conversation_id,user_id,title,body,date) VALUES ({$cmap[$k]},$from,'','$body','".zk_ts($t)."')")) {
+                $mc++;
+                if ($t > 0) $last[$cmap[$k]] = max($last[$cmap[$k]] ?? 0, $t);
+            }
         }
-        $stats['Conversations'] = $cid;
+        foreach ($last as $cv => $t) {
+            $d = zk_ts($t);
+            zk_q($se, "UPDATE engine4_messages_conversations SET modified='$d' WHERE conversation_id=$cv");
+            zk_q($se, "UPDATE engine4_messages_recipients SET inbox_updated='$d' WHERE conversation_id=$cv");
+        }
+        $stats['Conversations'] = $cc;
         $stats['Messages'] = $mc;
-        zk_out("  $cid conversations, $mc messages", 'ok');
+        zk_out("  $cc conversations, $mc messages", 'ok');
     }
 
     // ====== BLOCKS ======
     if (in_array('blocks', $_MIGRATION_STEPS)) {
         $step_num++;
         zk_out("[$step_num/$total_steps] Migrating Blocks...", 'info');
-        $se->query("TRUNCATE TABLE engine4_user_block");
-        $result = $wo->query("SELECT * FROM Wo_Blocks");
+        zk_q($se, "TRUNCATE TABLE engine4_user_block");
         $c = 0;
-        while ($b = $result->fetch_assoc()) {
-            $blocker = (int)$b['blocker']; $blocked = (int)$b['blocked'];
-            if ($blocker <= 0 || $blocked <= 0) continue;
-            $check = $se->query("SELECT COUNT(*) as c FROM engine4_users WHERE user_id IN ($blocker,$blocked)");
-            if ($check->fetch_assoc()['c'] < 2) continue;
-            if ($se->query("INSERT IGNORE INTO engine4_user_block (user_id,blocked_user_id) VALUES ($blocker,$blocked)")) $c++;
+        foreach (zk_rows($wo, "SELECT * FROM Wo_Blocks") as $b) {
+            if ((int)$b['blocker'] <= 0 || (int)$b['blocked'] <= 0) continue;
+            $blocker = $U($b['blocker']); $blocked = $U($b['blocked']);
+            if (!$both($blocker, $blocked)) continue;
+            $c += zk_q($se, "INSERT IGNORE INTO engine4_user_block (user_id,blocked_user_id) VALUES ($blocker,$blocked)");
         }
         $stats['Blocks'] = $c;
         zk_out("  $c blocks migrated", 'ok');
@@ -311,11 +365,12 @@ function zk_run_migration($_MIGRATION_STEPS, $_WO_CONFIG, $_SE_CONFIG) {
     zk_out("[$step_num/$total_steps] Setting profile permissions...", 'info');
     foreach (['view','comment'] as $action) {
         foreach (['everyone','member','registered','network'] as $role) {
-            $se->query("INSERT IGNORE INTO engine4_authorization_allow (resource_type,resource_id,action,role,role_id,value) SELECT 'user',user_id,'$action','$role',0,1 FROM engine4_users WHERE user_id > 1");
+            zk_q($se, "INSERT IGNORE INTO engine4_authorization_allow (resource_type,resource_id,action,role,role_id,value) SELECT 'user',user_id,'$action','$role',0,1 FROM engine4_users WHERE user_id > 1");
         }
     }
     $se->query("SET FOREIGN_KEY_CHECKS = 1");
     zk_out("  Done", 'ok');
+    if ($zk_failed) $stats['Rows skipped (errors)'] = $zk_failed;
 
     // Summary
     echo "</div><div class='summary'><h2>Migration Complete!</h2><table>";
@@ -346,20 +401,25 @@ if (isset($_POST['run_migration'])) {
 ob_implicit_flush(true);
 if (ob_get_level()) ob_end_flush();
 
-$steps = [];
-foreach (['users','followers','posts','reactions','comments','messages','blocks'] as $s) {
+// Users are required by every other step, so they always run (the checkbox cannot be unchecked).
+$steps = ['users'];
+foreach (['followers','posts','reactions','comments','messages','blocks'] as $s) {
     if (isset($_POST['migrate_' . $s])) $steps[] = $s;
 }
 
-if (empty($steps)) {
-    echo "<span class='err'>No data types selected.</span>\n";
+$missing = [];
+foreach (['wo_host','wo_user','wo_db','se_host','se_user','se_db'] as $field) {
+    if (empty($_POST[$field])) $missing[] = $field;
+}
+if (!empty($missing)) {
+    echo "<span class='err'>Missing required fields: " . implode(', ', $missing) . "</span>\n";
 } else {
     $_WO_CONFIG = [
-        'host' => $_POST['wo_host'], 'port' => (int)($_POST['wo_port'] ?: 3306),
+        'host' => $_POST['wo_host'], 'port' => (int)(($_POST['wo_port'] ?? '') ?: 3306),
         'user' => $_POST['wo_user'], 'pass' => $_POST['wo_pass'] ?? '', 'db' => $_POST['wo_db'],
     ];
     $_SE_CONFIG = [
-        'host' => $_POST['se_host'], 'port' => (int)($_POST['se_port'] ?: 3306),
+        'host' => $_POST['se_host'], 'port' => (int)(($_POST['se_port'] ?? '') ?: 3306),
         'user' => $_POST['se_user'], 'pass' => $_POST['se_pass'] ?? '', 'db' => $_POST['se_db'],
     ];
     zk_run_migration($steps, $_WO_CONFIG, $_SE_CONFIG);
@@ -377,7 +437,7 @@ if (isset($_POST['test_connection'])) {
     mysqli_report(MYSQLI_REPORT_OFF);
     header('Content-Type: application/json');
     $results = [];
-    $wo = @new mysqli($_POST['wo_host'], $_POST['wo_user'], $_POST['wo_pass'] ?? '', $_POST['wo_db'], (int)($_POST['wo_port'] ?: 3306));
+    $wo = @new mysqli($_POST['wo_host'] ?? '', $_POST['wo_user'] ?? '', $_POST['wo_pass'] ?? '', $_POST['wo_db'] ?? '', (int)(($_POST['wo_port'] ?? '') ?: 3306));
     if ($wo->connect_error) {
         $results['wowonder'] = ['status' => 'error', 'message' => $wo->connect_error];
     } else {
@@ -385,7 +445,7 @@ if (isset($_POST['test_connection'])) {
         $results['wowonder'] = $r ? ['status' => 'ok', 'users' => $r->fetch_assoc()['c']] : ['status' => 'error', 'message' => 'Wo_Users table not found.'];
         $wo->close();
     }
-    $se = @new mysqli($_POST['se_host'], $_POST['se_user'], $_POST['se_pass'] ?? '', $_POST['se_db'], (int)($_POST['se_port'] ?: 3306));
+    $se = @new mysqli($_POST['se_host'] ?? '', $_POST['se_user'] ?? '', $_POST['se_pass'] ?? '', $_POST['se_db'] ?? '', (int)(($_POST['se_port'] ?? '') ?: 3306));
     if ($se->connect_error) {
         $results['socialengine'] = ['status' => 'error', 'message' => $se->connect_error];
     } else {
@@ -400,7 +460,7 @@ if (isset($_POST['test_connection'])) {
 <!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>WoWonder to SocialEngine Migration | ZeronKit</title>
+<title>WoWonder to SocialEngine Migration v<?= ZERONKIT_VERSION ?> | ZeronKit</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0e1a;color:#c9d1d9;min-height:100vh}
@@ -469,7 +529,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
         <div class="card">
             <h2>What to Migrate <span class="badge badge-blue">Select</span></h2>
             <div class="checks">
-                <label class="check"><input type="checkbox" name="migrate_users" checked> Users & Passwords <span class="info">Required</span></label>
+                <label class="check"><input type="checkbox" checked disabled> Users & Passwords <span class="info">Required</span><input type="hidden" name="migrate_users" value="on"></label>
                 <label class="check"><input type="checkbox" name="migrate_followers" checked> Follows</label>
                 <label class="check"><input type="checkbox" name="migrate_posts" checked> Posts (as Activity)</label>
                 <label class="check"><input type="checkbox" name="migrate_comments" checked> Comments</label>
@@ -491,7 +551,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
             </button>
         </div>
     </form>
-    <div class="footer"><a href="<?= ZERONKIT_SITE ?>" target="_blank">zeronkit.com</a>: Free open-source migration tools</div>
+    <div class="footer"><a href="<?= ZERONKIT_SITE ?>" target="_blank">zeronkit.com</a>: Free open-source migration tools | v<?= ZERONKIT_VERSION ?></div>
 </div>
 <script>
 function hideA(){document.getElementById('alertError').style.display='none';document.getElementById('alertSuccess').style.display='none'}

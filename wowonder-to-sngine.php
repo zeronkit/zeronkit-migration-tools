@@ -1,7 +1,7 @@
 <?php
 /**
  * ZeronKit: WoWonder to Sngine Migration Tool
- * Version: 2.0
+ * Version: 2.1
  * Website: https://zeronkit.com
  *
  * Copyright (C) ZeronKit, https://zeronkit.com
@@ -37,7 +37,7 @@
  *  SUPPORT: contact@zeronkit.com
  */
 
-define('ZERONKIT_VERSION', '2.0');
+define('ZERONKIT_VERSION', '2.1');
 define('ZERONKIT_SITE', 'https://zeronkit.com');
 define('ZERONKIT_MIN_PHP', '7.4.0');
 
@@ -82,6 +82,36 @@ function zk_out($msg, $class = '') {
 function zk_esc($db, $v) { return $db->real_escape_string($v ?? ''); }
 function zk_ts($ts) { $t = (int)$ts; return $t > 0 ? date('Y-m-d H:i:s', $t) : date('Y-m-d H:i:s'); }
 
+// Run one write query. A failing row is reported and skipped, the run goes on. Returns the rows really written.
+function zk_q($db, $sql) {
+    global $zk_failed;
+    if ($db->query($sql)) return max(0, $db->affected_rows);
+    $zk_failed = (int)$zk_failed + 1;
+    if ($zk_failed <= 50) zk_out("  Skipped, database error: " . htmlspecialchars($db->error), 'warn');
+    elseif ($zk_failed == 51) zk_out("  More database errors: only the first 50 are shown", 'warn');
+    return 0;
+}
+
+// Read source rows. A missing table or column is reported and gives no rows instead of a fatal error.
+function zk_rows($db, $sql) {
+    $r = $db->query($sql);
+    if (!$r) { zk_out("  Could not read from WoWonder: " . htmlspecialchars($db->error) . " (skipped)", 'warn'); return; }
+    while ($row = $r->fetch_assoc()) yield $row;
+    $r->free();
+}
+
+// Open a database connection. Returns null and prints a clear message when the login fails.
+function zk_connect($cfg, $name) {
+    $db = @new mysqli($cfg['host'], $cfg['user'], $cfg['pass'], $cfg['db'], $cfg['port']);
+    if ($db->connect_error) {
+        zk_out("$name database connection failed: " . htmlspecialchars($db->connect_error), 'err');
+        zk_out("Nothing was changed. Check the $name host, port, username, password and database name, then try again.", 'err');
+        return null;
+    }
+    $db->set_charset('utf8mb4');
+    return $db;
+}
+
 // Fix WoWonder text formatting: [a]URL[/a], <br>, HTML entities, #[ID], @[ID]
 function zk_fix_text($text, $hashtags, $usernames) {
     // Fix #[ID] to #tag_name
@@ -120,14 +150,15 @@ function zk_fix_path($path) {
 function zk_run_migration($_MIGRATION_STEPS, $_WO_CONFIG, $_SN_CONFIG) {
     set_time_limit(0);
     ini_set('memory_limit', '2G');
+    // PHP 8.1+ turns every mysqli error into a fatal exception; every result is checked below instead.
+    mysqli_report(MYSQLI_REPORT_OFF);
+    global $zk_failed;
+    $zk_failed = 0;
 
-    $wo = new mysqli($_WO_CONFIG['host'], $_WO_CONFIG['user'], $_WO_CONFIG['pass'], $_WO_CONFIG['db'], $_WO_CONFIG['port']);
-    if ($wo->connect_error) { zk_out("WoWonder DB failed: " . $wo->connect_error, 'err'); return; }
-    $wo->set_charset('utf8mb4');
-
-    $sn = new mysqli($_SN_CONFIG['host'], $_SN_CONFIG['user'], $_SN_CONFIG['pass'], $_SN_CONFIG['db'], $_SN_CONFIG['port']);
-    if ($sn->connect_error) { zk_out("Sngine DB failed: " . $sn->connect_error, 'err'); return; }
-    $sn->set_charset('utf8mb4');
+    $wo = zk_connect($_WO_CONFIG, 'WoWonder');
+    if (!$wo) return;
+    $sn = zk_connect($_SN_CONFIG, 'Sngine');
+    if (!$sn) return;
 
     zk_out("Connected to both databases", 'ok');
     zk_out("");
@@ -141,23 +172,38 @@ function zk_run_migration($_MIGRATION_STEPS, $_WO_CONFIG, $_SN_CONFIG) {
     // Pre-load hashtags and usernames for text fixing
     zk_out("Loading hashtags and usernames for text processing...", 'info');
     $hashtags = [];
-    $r = $wo->query("SELECT id, tag FROM Wo_Hashtags");
-    while ($row = $r->fetch_assoc()) $hashtags[$row['id']] = $row['tag'];
+    foreach (zk_rows($wo, "SELECT id, tag FROM Wo_Hashtags") as $row) $hashtags[$row['id']] = $row['tag'];
 
     $usernames = [];
-    $r = $wo->query("SELECT user_id, username FROM Wo_Users");
-    while ($row = $r->fetch_assoc()) $usernames[$row['user_id']] = $row['username'];
+    foreach (zk_rows($wo, "SELECT user_id, username FROM Wo_Users") as $row) $usernames[$row['user_id']] = $row['username'];
     zk_out("  Loaded " . count($hashtags) . " hashtags, " . count($usernames) . " usernames", 'ok');
     zk_out("");
+
+    // The Sngine admin keeps id 1. WoWonder user 1 gets the first id after the last WoWonder user,
+    // and $U() moves every reference to WoWonder user 1 along with it.
+    $u1 = 1;
+    $U = function ($id) use (&$u1) { $id = (int)$id; return $id === 1 ? $u1 : $id; };
 
     // ====== USERS ======
     if (in_array('users', $_MIGRATION_STEPS)) {
         $step_num++;
         zk_out("[$step_num/$total_steps] Migrating Users...", 'info');
-        $sn->query("DELETE FROM users WHERE user_id > 1");
-        $result = $wo->query("SELECT * FROM Wo_Users ORDER BY user_id ASC");
+        zk_q($sn, "DELETE FROM users WHERE user_id > 1");
         $c = 0;
-        while ($u = $result->fetch_assoc()) {
+        foreach (zk_rows($wo, "SELECT * FROM Wo_Users ORDER BY user_id ASC") as $u) {
+            $id = (int)$u['user_id'];
+            if ($id === 1) {
+                $name = htmlspecialchars($u['username']);
+                $dup = $sn->query("SELECT user_id FROM users WHERE user_name='" . zk_esc($sn,$u['username']) . "' OR user_email='" . zk_esc($sn,$u['email']) . "' LIMIT 1");
+                if ($dup && $dup->num_rows) {
+                    $stats['WoWonder user 1'] = "same as Sngine admin, merged into id 1";
+                    zk_out("  WoWonder user 1 ($name) has the same username or email as the Sngine admin: no second account was made, its content now belongs to the admin (id 1). The admin login is unchanged.", 'warn');
+                    continue;
+                }
+                $u1 = $id = max(array_keys($usernames)) + 1;
+                $stats['WoWonder user 1'] = "moved to id $id";
+                zk_out("  WoWonder user 1 ($name) is migrated as user id $id, because id 1 is the Sngine admin (left unchanged).", 'warn');
+            }
             $admin = ($u['admin'] == '1') ? 1 : 3;
             $gender = 'NULL';
             if ($u['gender'] == 'male') $gender = 1; elseif ($u['gender'] == 'female') $gender = 2;
@@ -165,13 +211,14 @@ function zk_run_migration($_MIGRATION_STEPS, $_WO_CONFIG, $_SN_CONFIG) {
             $bd = $u['birthday'] ?? '';
             $bday = ($bd && $bd != '0000-00-00' && $bd != '0') ? "'" . zk_esc($sn, $bd) . "'" : 'NULL';
             $time = zk_ts($u['joined'] ?? 0);
+            $seen = zk_ts(($u['lastseen'] ?? 0) ?: ($u['joined'] ?? 0));
             $active = ($u['active'] == '1') ? '1' : '0';
             // Fix avatar/cover paths
             $avatar = zk_fix_path($u['avatar'] ?? '');
             $cover = zk_fix_path($u['cover'] ?? '');
 
-            $sql = "INSERT INTO users (user_id,user_group,user_name,user_email,user_password,user_firstname,user_lastname,user_gender,user_country,user_birthdate,user_picture,user_cover,user_biography,user_website,user_verified,user_activated,user_approved,user_email_verified,user_registered,user_last_seen) VALUES ({$u['user_id']},$admin,'" . zk_esc($sn,$u['username']) . "','" . zk_esc($sn,$u['email']) . "','" . zk_esc($sn,$u['password']) . "','" . zk_esc($sn,$u['first_name']?:$u['username']) . "','" . zk_esc($sn,$u['last_name']) . "',$gender,$country,$bday,'" . zk_esc($sn,$avatar) . "','" . zk_esc($sn,$cover) . "','" . zk_esc($sn,$u['about']) . "','" . zk_esc($sn,$u['website']) . "','" . (($u['verified']=='1')?'1':'0') . "','$active','1','$active','$time','$time') ON DUPLICATE KEY UPDATE user_name=VALUES(user_name)";
-            if ($sn->query($sql)) $c++;
+            $sql = "INSERT INTO users (user_id,user_group,user_name,user_email,user_password,user_firstname,user_lastname,user_gender,user_country,user_birthdate,user_picture,user_cover,user_biography,user_website,user_verified,user_activated,user_approved,user_email_verified,user_registered,user_last_seen) VALUES ($id,$admin,'" . zk_esc($sn,$u['username']) . "','" . zk_esc($sn,$u['email']) . "','" . zk_esc($sn,$u['password']) . "','" . zk_esc($sn,$u['first_name']?:$u['username']) . "','" . zk_esc($sn,$u['last_name']) . "',$gender,$country,$bday,'" . zk_esc($sn,$avatar) . "','" . zk_esc($sn,$cover) . "','" . zk_esc($sn,$u['about']) . "','" . zk_esc($sn,$u['website']) . "','" . (($u['verified']=='1')?'1':'0') . "','$active','1','$active','$time','$seen')";
+            $c += zk_q($sn, $sql);
         }
         $stats['Users'] = $c;
         zk_out("  $c users migrated", 'ok');
@@ -181,14 +228,13 @@ function zk_run_migration($_MIGRATION_STEPS, $_WO_CONFIG, $_SN_CONFIG) {
     if (in_array('followers', $_MIGRATION_STEPS)) {
         $step_num++;
         zk_out("[$step_num/$total_steps] Migrating Followers...", 'info');
-        $sn->query("TRUNCATE TABLE followings"); $sn->query("TRUNCATE TABLE friends");
-        $result = $wo->query("SELECT * FROM Wo_Followers WHERE active = 1");
+        zk_q($sn, "TRUNCATE TABLE followings"); zk_q($sn, "TRUNCATE TABLE friends");
         $cf=0;$cfr=0;$pairs=[];
-        while ($f = $result->fetch_assoc()) {
-            $a=(int)$f['follower_id'];$b=(int)$f['following_id'];
-            $sn->query("INSERT IGNORE INTO followings (user_id,following_id,time) VALUES ($a,$b,'".zk_ts($f['time'])."')");$cf++;
+        foreach (zk_rows($wo, "SELECT * FROM Wo_Followers WHERE active = 1") as $f) {
+            $a=$U($f['follower_id']);$b=$U($f['following_id']);
+            $cf+=zk_q($sn,"INSERT IGNORE INTO followings (user_id,following_id,time) VALUES ($a,$b,'".zk_ts($f['time'])."')");
             $k=min($a,$b).'-'.max($a,$b);
-            if(isset($pairs[$k])){$sn->query("INSERT IGNORE INTO friends (user_one_id,user_two_id,status) VALUES (".min($a,$b).",".max($a,$b).",1)");$cfr++;}
+            if(isset($pairs[$k]))$cfr+=zk_q($sn,"INSERT IGNORE INTO friends (user_one_id,user_two_id,status) VALUES (".min($a,$b).",".max($a,$b).",1)");
             else $pairs[$k]=true;
         }
         $stats['Followings']=$cf;$stats['Friends']=$cfr;
@@ -199,16 +245,15 @@ function zk_run_migration($_MIGRATION_STEPS, $_WO_CONFIG, $_SN_CONFIG) {
     if (in_array('pages', $_MIGRATION_STEPS)) {
         $step_num++;
         zk_out("[$step_num/$total_steps] Migrating Pages...", 'info');
-        $sn->query("DELETE FROM pages WHERE page_id > 0"); $sn->query("TRUNCATE TABLE pages_likes");
-        $result = $wo->query("SELECT * FROM Wo_Pages ORDER BY page_id ASC");
+        zk_q($sn, "DELETE FROM pages WHERE page_id > 0"); zk_q($sn, "TRUNCATE TABLE pages_likes");
         $c=0;
-        while ($p = $result->fetch_assoc()) {
+        foreach (zk_rows($wo, "SELECT * FROM Wo_Pages ORDER BY page_id ASC") as $p) {
             $avatar = zk_fix_path($p['avatar'] ?? '');
             $cover = zk_fix_path($p['cover'] ?? '');
-            if($sn->query("INSERT INTO pages (page_id,page_admin,page_category,page_name,page_title,page_description,page_picture,page_cover,page_verified,page_website,page_phone,page_company,page_location,page_country,page_language,page_date) VALUES ({$p['page_id']},{$p['user_id']},1,'".zk_esc($sn,$p['page_name'])."','".zk_esc($sn,$p['page_title'])."','".zk_esc($sn,$p['page_description'])."','".zk_esc($sn,$avatar)."','".zk_esc($sn,$cover)."','".(($p['verified']??'0')=='1'?'1':'0')."','".zk_esc($sn,$p['website'])."','".zk_esc($sn,$p['phone'])."','".zk_esc($sn,$p['company'])."','".zk_esc($sn,$p['address'])."',0,0,'".zk_ts($p['time']??0)."')"))$c++;
+            $c+=zk_q($sn,"INSERT INTO pages (page_id,page_admin,page_category,page_name,page_title,page_description,page_picture,page_cover,page_verified,page_website,page_phone,page_company,page_location,page_country,page_language,page_date) VALUES (".(int)$p['page_id'].",".$U($p['user_id']).",1,'".zk_esc($sn,$p['page_name'])."','".zk_esc($sn,$p['page_title'])."','".zk_esc($sn,$p['page_description'])."','".zk_esc($sn,$avatar)."','".zk_esc($sn,$cover)."','".(($p['verified']??'0')=='1'?'1':'0')."','".zk_esc($sn,$p['website'])."','".zk_esc($sn,$p['phone'])."','".zk_esc($sn,$p['company'])."','".zk_esc($sn,$p['address'])."',0,0,'".zk_ts($p['time']??0)."')");
         }
-        $result=$wo->query("SELECT * FROM Wo_Pages_Likes");$cl=0;
-        while($pl=$result->fetch_assoc()){$sn->query("INSERT IGNORE INTO pages_likes (page_id,user_id) VALUES ({$pl['page_id']},{$pl['user_id']})");$cl++;}
+        $cl=0;
+        foreach (zk_rows($wo, "SELECT * FROM Wo_Pages_Likes") as $pl) $cl+=zk_q($sn,"INSERT IGNORE INTO pages_likes (page_id,user_id) VALUES (".(int)$pl['page_id'].",".$U($pl['user_id']).")");
         $stats['Pages']=$c;$stats['Page Likes']=$cl;
         zk_out("  $c pages, $cl likes",'ok');
     }
@@ -217,16 +262,16 @@ function zk_run_migration($_MIGRATION_STEPS, $_WO_CONFIG, $_SN_CONFIG) {
     if (in_array('groups', $_MIGRATION_STEPS)) {
         $step_num++;
         zk_out("[$step_num/$total_steps] Migrating Groups...", 'info');
-        $sn->query("DELETE FROM `groups` WHERE group_id > 0"); $sn->query("TRUNCATE TABLE groups_members");
-        $result=$wo->query("SELECT * FROM Wo_Groups ORDER BY id ASC");$c=0;
-        while($g=$result->fetch_assoc()){
+        zk_q($sn, "DELETE FROM `groups` WHERE group_id > 0"); zk_q($sn, "TRUNCATE TABLE groups_members");
+        $c=0;
+        foreach (zk_rows($wo, "SELECT * FROM Wo_Groups ORDER BY id ASC") as $g) {
             $pr=($g['privacy']=='2')?'closed':'public';
             $avatar = zk_fix_path($g['avatar'] ?? '');
             $cover = zk_fix_path($g['cover'] ?? '');
-            if($sn->query("INSERT INTO `groups` (group_id,group_admin,group_category,group_name,group_title,group_description,group_privacy,group_picture,group_cover,group_country,group_language,group_date) VALUES ({$g['id']},{$g['user_id']},1,'".zk_esc($sn,$g['group_name'])."','".zk_esc($sn,$g['group_title'])."','".zk_esc($sn,$g['about'])."','$pr','".zk_esc($sn,$avatar)."','".zk_esc($sn,$cover)."',0,0,'".zk_ts($g['time'])."')"))$c++;
+            $c+=zk_q($sn,"INSERT INTO `groups` (group_id,group_admin,group_category,group_name,group_title,group_description,group_privacy,group_picture,group_cover,group_country,group_language,group_date) VALUES (".(int)$g['id'].",".$U($g['user_id']).",1,'".zk_esc($sn,$g['group_name'])."','".zk_esc($sn,$g['group_title'])."','".zk_esc($sn,$g['about'])."','$pr','".zk_esc($sn,$avatar)."','".zk_esc($sn,$cover)."',0,0,'".zk_ts($g['time'])."')");
         }
-        $result=$wo->query("SELECT * FROM Wo_Group_Members WHERE active='1'");$cm=0;
-        while($gm=$result->fetch_assoc()){$sn->query("INSERT IGNORE INTO groups_members (group_id,user_id,approved) VALUES ({$gm['group_id']},{$gm['user_id']},'1')");$cm++;}
+        $cm=0;
+        foreach (zk_rows($wo, "SELECT * FROM Wo_Group_Members WHERE active='1'") as $gm) $cm+=zk_q($sn,"INSERT IGNORE INTO groups_members (group_id,user_id,approved) VALUES (".(int)$gm['group_id'].",".$U($gm['user_id']).",'1')");
         $stats['Groups']=$c;$stats['Group Members']=$cm;
         zk_out("  $c groups, $cm members",'ok');
     }
@@ -235,11 +280,13 @@ function zk_run_migration($_MIGRATION_STEPS, $_WO_CONFIG, $_SN_CONFIG) {
     if (in_array('posts', $_MIGRATION_STEPS)) {
         $step_num++;
         zk_out("[$step_num/$total_steps] Migrating Posts...", 'info');
-        $sn->query("TRUNCATE TABLE posts");$sn->query("TRUNCATE TABLE posts_photos");$sn->query("TRUNCATE TABLE posts_videos");
-        $sn->query("TRUNCATE TABLE posts_products");$sn->query("TRUNCATE TABLE posts_articles");
-        $sn->query("TRUNCATE TABLE hashtags_posts");
-        $result=$wo->query("SELECT * FROM Wo_Posts ORDER BY id ASC");$c=0;
-        while($p=$result->fetch_assoc()){
+        zk_q($sn,"TRUNCATE TABLE posts");zk_q($sn,"TRUNCATE TABLE posts_photos");zk_q($sn,"TRUNCATE TABLE posts_videos");
+        zk_q($sn,"TRUNCATE TABLE posts_products");zk_q($sn,"TRUNCATE TABLE posts_articles");
+        zk_q($sn,"TRUNCATE TABLE hashtags_posts");
+        $c=0;
+        foreach (zk_rows($wo, "SELECT * FROM Wo_Posts ORDER BY id ASC") as $p) {
+            $post_id=(int)$p['id'];
+            $views=(int)($p['videoViews'] ?? 0);
             // Fix text: hashtags, mentions, links, formatting
             $raw_text = $p['postText'] ?? '';
             $fixed_text = zk_fix_text($raw_text, $hashtags, $usernames);
@@ -266,15 +313,15 @@ function zk_run_migration($_MIGRATION_STEPS, $_WO_CONFIG, $_SN_CONFIG) {
             elseif(!empty($file))$pt='file';
 
             $pv='public';if($p['postPrivacy']=='2')$pv='friends';elseif($p['postPrivacy']=='3')$pv='me';
-            $ig=($p['group_id']>0)?'1':'0';$gid=($p['group_id']>0)?$p['group_id']:'NULL';
-            $ut=($p['page_id']>0)?'page':'user';$uid=($p['page_id']>0)?$p['page_id']:(int)$p['user_id'];
-            $oid=($p['postShare']>0)?$p['postShare']:'NULL';
+            $ig=($p['group_id']>0)?'1':'0';$gid=($p['group_id']>0)?(int)$p['group_id']:'NULL';
+            $ut=($p['page_id']>0)?'page':'user';$uid=($p['page_id']>0)?(int)$p['page_id']:$U($p['user_id']);
+            $oid=($p['postShare']>0)?(int)$p['postShare']:'NULL';
             $loc=!empty($p['postMap'])?"'".zk_esc($sn,$p['postMap'])."'":'NULL';
             $fa='NULL';$fv='NULL';
             foreach(['postFeeling'=>'feeling','postListening'=>'listening','postTraveling'=>'traveling','postWatching'=>'watching','postPlaying'=>'playing'] as $col=>$act){
                 if(!empty($p[$col])){$fa="'$act'";$fv="'".zk_esc($sn,$p[$col])."'";break;}
             }
-            if($sn->query("INSERT INTO posts (post_id,user_id,user_type,post_type,in_group,group_id,time,privacy,text,feeling_action,feeling_value,location,origin_id,comments,shares,views) VALUES ({$p['id']},$uid,'$ut','$pt','$ig',$gid,'$time','$pv','$txt',$fa,$fv,$loc,$oid,0,0,{$p['videoViews']})")){
+            if(zk_q($sn,"INSERT INTO posts (post_id,user_id,user_type,post_type,in_group,group_id,time,privacy,text,feeling_action,feeling_value,location,origin_id,comments,shares,views) VALUES ($post_id,$uid,'$ut','$pt','$ig',$gid,'$time','$pv','$txt',$fa,$fv,$loc,$oid,0,0,$views)")){
                 $c++;
 
                 // Insert media from postFile
@@ -282,9 +329,9 @@ function zk_run_migration($_MIGRATION_STEPS, $_WO_CONFIG, $_SN_CONFIG) {
                     $fixed_file = zk_fix_path($file);
                     $fixed_thumb = zk_fix_path($p['postFileThumb'] ?? '');
                     if ($pt == 'photos') {
-                        $sn->query("INSERT INTO posts_photos (post_id,source) VALUES ({$p['id']},'".zk_esc($sn,$fixed_file)."')");
+                        zk_q($sn,"INSERT INTO posts_photos (post_id,source) VALUES ($post_id,'".zk_esc($sn,$fixed_file)."')");
                     } elseif ($pt == 'video') {
-                        $sn->query("INSERT INTO posts_videos (post_id,category_id,source,thumbnail,views) VALUES ({$p['id']},0,'".zk_esc($sn,$fixed_file)."','".zk_esc($sn,$fixed_thumb)."',{$p['videoViews']})");
+                        zk_q($sn,"INSERT INTO posts_videos (post_id,category_id,source,thumbnail,views) VALUES ($post_id,0,'".zk_esc($sn,$fixed_file)."','".zk_esc($sn,$fixed_thumb)."',$views)");
                     }
                 }
 
@@ -293,7 +340,7 @@ function zk_run_migration($_MIGRATION_STEPS, $_WO_CONFIG, $_SN_CONFIG) {
                 if (!empty($hmatches[1])) {
                     foreach (array_unique($hmatches[1]) as $hid) {
                         if (isset($hashtags[$hid])) {
-                            $sn->query("INSERT IGNORE INTO hashtags_posts (hashtag_id,post_id) VALUES ($hid,{$p['id']})");
+                            zk_q($sn,"INSERT IGNORE INTO hashtags_posts (hashtag_id,post_id) VALUES ($hid,$post_id)");
                         }
                     }
                 }
@@ -301,22 +348,22 @@ function zk_run_migration($_MIGRATION_STEPS, $_WO_CONFIG, $_SN_CONFIG) {
         }
 
         // Insert album media (multi-image posts)
-        $result = $wo->query("SELECT * FROM Wo_Albums_Media WHERE image != '' ORDER BY id ASC");
         $album_c = 0;
-        while ($am = $result->fetch_assoc()) {
+        foreach (zk_rows($wo, "SELECT * FROM Wo_Albums_Media WHERE image != '' ORDER BY id ASC") as $am) {
             $post_id = (int)$am['post_id'];
             $check = $sn->query("SELECT post_id FROM posts WHERE post_id = $post_id");
             if ($check && $check->num_rows > 0) {
                 $fixed_img = zk_fix_path($am['image']);
-                $sn->query("INSERT INTO posts_photos (post_id,source) VALUES ($post_id,'".zk_esc($sn,$fixed_img)."')");
-                $sn->query("UPDATE posts SET post_type='photos' WHERE post_id=$post_id");
-                $album_c++;
+                if (zk_q($sn,"INSERT INTO posts_photos (post_id,source) VALUES ($post_id,'".zk_esc($sn,$fixed_img)."')")) {
+                    zk_q($sn,"UPDATE posts SET post_type='photos' WHERE post_id=$post_id");
+                    $album_c++;
+                }
             }
         }
 
         $stats['Posts']=$c;
-        $stats['Photos']=$sn->query("SELECT COUNT(*) as c FROM posts_photos")->fetch_assoc()['c'];
-        $stats['Videos']=$sn->query("SELECT COUNT(*) as c FROM posts_videos")->fetch_assoc()['c'];
+        $r=$sn->query("SELECT COUNT(*) as c FROM posts_photos");$stats['Photos']=$r?(int)$r->fetch_assoc()['c']:0;
+        $r=$sn->query("SELECT COUNT(*) as c FROM posts_videos");$stats['Videos']=$r?(int)$r->fetch_assoc()['c']:0;
         zk_out("  $c posts, {$stats['Photos']} photos, {$stats['Videos']} videos, $album_c album items",'ok');
     }
 
@@ -324,18 +371,19 @@ function zk_run_migration($_MIGRATION_STEPS, $_WO_CONFIG, $_SN_CONFIG) {
     if (in_array('reactions', $_MIGRATION_STEPS)) {
         $step_num++;
         zk_out("[$step_num/$total_steps] Migrating Reactions (may take a while)...", 'info');
-        $sn->query("TRUNCATE TABLE posts_reactions");$sn->query("TRUNCATE TABLE posts_comments_reactions");
+        zk_q($sn,"TRUNCATE TABLE posts_reactions");zk_q($sn,"TRUNCATE TABLE posts_comments_reactions");
         $rm=['1'=>'like','2'=>'love','3'=>'haha','4'=>'yay','5'=>'wow','6'=>'sad','7'=>'angry','like'=>'like','love'=>'love','haha'=>'haha','wow'=>'wow','sad'=>'sad','angry'=>'angry','yay'=>'yay'];
-        $result=$wo->query("SELECT * FROM Wo_Reactions WHERE post_id > 0");$cr=0;$rc=[];
-        while($r=$result->fetch_assoc()){
+        // WoWonder stores no reaction time, so the run time is used.
+        $cr=0;$rc=[];
+        foreach (zk_rows($wo, "SELECT * FROM Wo_Reactions WHERE post_id > 0") as $r) {
             $pid=(int)$r['post_id'];$m=$rm[strtolower($r['reaction']??'like')]??'like';
-            if($sn->query("INSERT IGNORE INTO posts_reactions (post_id,user_id,reaction,reaction_time) VALUES ($pid,{$r['user_id']},'$m',NOW())"))
+            if(zk_q($sn,"INSERT IGNORE INTO posts_reactions (post_id,user_id,reaction,reaction_time) VALUES ($pid,".$U($r['user_id']).",'$m',NOW())"))
             {$cr++;$rc[$pid][$m]=($rc[$pid][$m]??0)+1;}
         }
-        foreach($rc as $pid=>$rr){$s=[];foreach(['like','love','haha','yay','wow','sad','angry'] as $r)$s[]="reaction_{$r}_count=".($rr[$r]??0);$sn->query("UPDATE posts SET ".implode(',',$s)." WHERE post_id=$pid");}
+        foreach($rc as $pid=>$rr){$s=[];foreach(['like','love','haha','yay','wow','sad','angry'] as $r)$s[]="reaction_{$r}_count=".($rr[$r]??0);zk_q($sn,"UPDATE posts SET ".implode(',',$s)." WHERE post_id=$pid");}
         $stats['Reactions']=$cr;
-        $result=$wo->query("SELECT * FROM Wo_Reactions WHERE comment_id > 0");$ccr=0;
-        while($r=$result->fetch_assoc()){$m=$rm[strtolower($r['reaction']??'like')]??'like';if($sn->query("INSERT IGNORE INTO posts_comments_reactions (comment_id,user_id,reaction,reaction_time) VALUES ({$r['comment_id']},{$r['user_id']},'$m',NOW())"))$ccr++;}
+        $ccr=0;
+        foreach (zk_rows($wo, "SELECT * FROM Wo_Reactions WHERE comment_id > 0") as $r) {$m=$rm[strtolower($r['reaction']??'like')]??'like';$ccr+=zk_q($sn,"INSERT IGNORE INTO posts_comments_reactions (comment_id,user_id,reaction,reaction_time) VALUES (".(int)$r['comment_id'].",".$U($r['user_id']).",'$m',NOW())");}
         $stats['Comment Reactions']=$ccr;
         zk_out("  $cr post reactions, $ccr comment reactions",'ok');
     }
@@ -344,20 +392,20 @@ function zk_run_migration($_MIGRATION_STEPS, $_WO_CONFIG, $_SN_CONFIG) {
     if (in_array('comments', $_MIGRATION_STEPS)) {
         $step_num++;
         zk_out("[$step_num/$total_steps] Migrating Comments...", 'info');
-        $sn->query("DELETE FROM posts_comments WHERE comment_id > 0");
-        $result=$wo->query("SELECT * FROM Wo_Comments ORDER BY id ASC");$cc=0;
-        while($c=$result->fetch_assoc()){
+        zk_q($sn,"DELETE FROM posts_comments WHERE comment_id > 0");
+        $cc=0;
+        foreach (zk_rows($wo, "SELECT * FROM Wo_Comments ORDER BY id ASC") as $c) {
             $fixed_text = zk_fix_text($c['text'] ?? '', $hashtags, $usernames);
             $fixed_img = zk_fix_path($c['c_file'] ?? '');
-            if($sn->query("INSERT INTO posts_comments (comment_id,node_id,node_type,user_id,user_type,text,image,time) VALUES ({$c['id']},{$c['post_id']},'post',{$c['user_id']},'user','".zk_esc($sn,$fixed_text)."','".zk_esc($sn,$fixed_img)."','".zk_ts($c['time'])."')"))$cc++;
+            $cc+=zk_q($sn,"INSERT INTO posts_comments (comment_id,node_id,node_type,user_id,user_type,text,image,time) VALUES (".(int)$c['id'].",".(int)$c['post_id'].",'post',".$U($c['user_id']).",'user','".zk_esc($sn,$fixed_text)."','".zk_esc($sn,$fixed_img)."','".zk_ts($c['time'])."')");
         }
-        $result=$wo->query("SELECT * FROM Wo_Comment_Replies ORDER BY id ASC");$cr=0;
-        while($r=$result->fetch_assoc()){
+        $cr=0;
+        foreach (zk_rows($wo, "SELECT * FROM Wo_Comment_Replies ORDER BY id ASC") as $r) {
             $fixed_text = zk_fix_text($r['text'] ?? '', $hashtags, $usernames);
             $fixed_img = zk_fix_path($r['c_file'] ?? '');
-            if($sn->query("INSERT INTO posts_comments (node_id,node_type,user_id,user_type,text,image,time) VALUES ({$r['comment_id']},'comment',{$r['user_id']},'user','".zk_esc($sn,$fixed_text)."','".zk_esc($sn,$fixed_img)."','".zk_ts($r['time'])."')"))$cr++;
+            $cr+=zk_q($sn,"INSERT INTO posts_comments (node_id,node_type,user_id,user_type,text,image,time) VALUES (".(int)$r['comment_id'].",'comment',".$U($r['user_id']).",'user','".zk_esc($sn,$fixed_text)."','".zk_esc($sn,$fixed_img)."','".zk_ts($r['time'])."')");
         }
-        $sn->query("UPDATE posts p SET comments=(SELECT COUNT(*) FROM posts_comments c WHERE c.node_id=p.post_id AND c.node_type='post')");
+        zk_q($sn,"UPDATE posts p SET comments=(SELECT COUNT(*) FROM posts_comments c WHERE c.node_id=p.post_id AND c.node_type='post')");
         $stats['Comments']=$cc;$stats['Replies']=$cr;
         zk_out("  $cc comments, $cr replies",'ok');
     }
@@ -366,32 +414,37 @@ function zk_run_migration($_MIGRATION_STEPS, $_WO_CONFIG, $_SN_CONFIG) {
     if (in_array('messages', $_MIGRATION_STEPS)) {
         $step_num++;
         zk_out("[$step_num/$total_steps] Migrating Messages...", 'info');
-        $sn->query("TRUNCATE TABLE conversations");$sn->query("TRUNCATE TABLE conversations_messages");$sn->query("TRUNCATE TABLE conversations_users");
-        $result=$wo->query("SELECT DISTINCT LEAST(from_id,to_id) as u1, GREATEST(from_id,to_id) as u2 FROM Wo_Messages WHERE to_id>0 AND from_id>0 AND group_id=0 AND page_id=0");
-        $cmap=[];$cid=0;
-        while($pair=$result->fetch_assoc()){$cid++;$cmap[$pair['u1'].'-'.$pair['u2']]=$cid;$sn->query("INSERT INTO conversations (conversation_id,last_message_id) VALUES ($cid,0)");$sn->query("INSERT INTO conversations_users (conversation_id,user_id,seen) VALUES ($cid,{$pair['u1']},'1')");$sn->query("INSERT INTO conversations_users (conversation_id,user_id,seen) VALUES ($cid,{$pair['u2']},'1')");}
-        $result=$wo->query("SELECT * FROM Wo_Messages WHERE to_id>0 AND from_id>0 AND group_id=0 AND page_id=0 ORDER BY id ASC");
+        zk_q($sn,"TRUNCATE TABLE conversations");zk_q($sn,"TRUNCATE TABLE conversations_messages");zk_q($sn,"TRUNCATE TABLE conversations_users");
+        $cmap=[];$cid=0;$cc=0;
+        foreach (zk_rows($wo, "SELECT DISTINCT LEAST(from_id,to_id) as u1, GREATEST(from_id,to_id) as u2 FROM Wo_Messages WHERE to_id>0 AND from_id>0 AND group_id=0 AND page_id=0") as $pair) {
+            $a=$U($pair['u1']);$b=$U($pair['u2']);
+            $cid++;$cmap[min($a,$b).'-'.max($a,$b)]=$cid;
+            $cc+=zk_q($sn,"INSERT INTO conversations (conversation_id,last_message_id) VALUES ($cid,0)");
+            zk_q($sn,"INSERT INTO conversations_users (conversation_id,user_id,seen) VALUES ($cid,$a,'1')");
+            zk_q($sn,"INSERT INTO conversations_users (conversation_id,user_id,seen) VALUES ($cid,$b,'1')");
+        }
         $mc=0;$last=[];
-        while($m=$result->fetch_assoc()){
-            $k=min($m['from_id'],$m['to_id']).'-'.max($m['from_id'],$m['to_id']);
+        foreach (zk_rows($wo, "SELECT * FROM Wo_Messages WHERE to_id>0 AND from_id>0 AND group_id=0 AND page_id=0 ORDER BY id ASC") as $m) {
+            $from=$U($m['from_id']);$to=$U($m['to_id']);
+            $k=min($from,$to).'-'.max($from,$to);
             if(!isset($cmap[$k]))continue;$cv=$cmap[$k];
             $fixed_text = zk_fix_text($m['text'] ?? '', $hashtags, $usernames);
             $fixed_media = zk_fix_path($m['media'] ?? '');
-            if($sn->query("INSERT INTO conversations_messages (conversation_id,user_id,message,image,time) VALUES ($cv,{$m['from_id']},'".zk_esc($sn,$fixed_text)."','".zk_esc($sn,$fixed_media)."','".zk_ts($m['time'])."')"))
+            if(zk_q($sn,"INSERT INTO conversations_messages (conversation_id,user_id,message,image,time) VALUES ($cv,$from,'".zk_esc($sn,$fixed_text)."','".zk_esc($sn,$fixed_media)."','".zk_ts($m['time'])."')"))
             {$mc++;$last[$cv]=$sn->insert_id;}
         }
-        foreach($last as $cv=>$lid)$sn->query("UPDATE conversations SET last_message_id=$lid WHERE conversation_id=$cv");
-        $stats['Conversations']=$cid;$stats['Messages']=$mc;
-        zk_out("  $cid conversations, $mc messages",'ok');
+        foreach($last as $cv=>$lid)zk_q($sn,"UPDATE conversations SET last_message_id=$lid WHERE conversation_id=$cv");
+        $stats['Conversations']=$cc;$stats['Messages']=$mc;
+        zk_out("  $cc conversations, $mc messages",'ok');
     }
 
     // ====== HASHTAGS ======
     if (in_array('hashtags', $_MIGRATION_STEPS)) {
         $step_num++;
         zk_out("[$step_num/$total_steps] Migrating Hashtags...", 'info');
-        $sn->query("TRUNCATE TABLE hashtags");
-        $result=$wo->query("SELECT * FROM Wo_Hashtags ORDER BY id ASC");$c=0;
-        while($h=$result->fetch_assoc()){if($sn->query("INSERT IGNORE INTO hashtags (hashtag_id,hashtag) VALUES ({$h['id']},'".zk_esc($sn,$h['tag'])."')"))$c++;}
+        zk_q($sn,"TRUNCATE TABLE hashtags");
+        $c=0;
+        foreach (zk_rows($wo, "SELECT * FROM Wo_Hashtags ORDER BY id ASC") as $h) $c+=zk_q($sn,"INSERT IGNORE INTO hashtags (hashtag_id,hashtag) VALUES (".(int)$h['id'].",'".zk_esc($sn,$h['tag'])."')");
         $stats['Hashtags']=$c;
         zk_out("  $c hashtags",'ok');
     }
@@ -400,9 +453,9 @@ function zk_run_migration($_MIGRATION_STEPS, $_WO_CONFIG, $_SN_CONFIG) {
     if (in_array('blocks', $_MIGRATION_STEPS)) {
         $step_num++;
         zk_out("[$step_num/$total_steps] Migrating Blocks...", 'info');
-        $sn->query("TRUNCATE TABLE users_blocks");
-        $result=$wo->query("SELECT * FROM Wo_Blocks");$c=0;
-        while($b=$result->fetch_assoc()){if($sn->query("INSERT IGNORE INTO users_blocks (user_id,blocked_id) VALUES ({$b['blocker']},{$b['blocked']})"))$c++;}
+        zk_q($sn,"TRUNCATE TABLE users_blocks");
+        $c=0;
+        foreach (zk_rows($wo, "SELECT * FROM Wo_Blocks") as $b) $c+=zk_q($sn,"INSERT IGNORE INTO users_blocks (user_id,blocked_id) VALUES (".$U($b['blocker']).",".$U($b['blocked']).")");
         $stats['Blocks']=$c;
         zk_out("  $c blocks",'ok');
     }
@@ -411,9 +464,9 @@ function zk_run_migration($_MIGRATION_STEPS, $_WO_CONFIG, $_SN_CONFIG) {
     if (in_array('saved_posts', $_MIGRATION_STEPS)) {
         $step_num++;
         zk_out("[$step_num/$total_steps] Migrating Saved Posts...", 'info');
-        $sn->query("TRUNCATE TABLE posts_saved");
-        $result=$wo->query("SELECT * FROM Wo_SavedPosts");$c=0;
-        while($s=$result->fetch_assoc()){if($sn->query("INSERT IGNORE INTO posts_saved (post_id,user_id,time) VALUES ({$s['post_id']},{$s['user_id']},'".zk_ts($s['time']??0)."')"))$c++;}
+        zk_q($sn,"TRUNCATE TABLE posts_saved");
+        $c=0;
+        foreach (zk_rows($wo, "SELECT * FROM Wo_SavedPosts") as $s) $c+=zk_q($sn,"INSERT IGNORE INTO posts_saved (post_id,user_id,time) VALUES (".(int)$s['post_id'].",".$U($s['user_id']).",'".zk_ts($s['time']??0)."')");
         $stats['Saved Posts']=$c;
         zk_out("  $c saved posts",'ok');
     }
@@ -422,15 +475,17 @@ function zk_run_migration($_MIGRATION_STEPS, $_WO_CONFIG, $_SN_CONFIG) {
     if (in_array('events', $_MIGRATION_STEPS)) {
         $step_num++;
         zk_out("[$step_num/$total_steps] Migrating Events...", 'info');
-        $sn->query("DELETE FROM events WHERE event_id > 0");
-        $result=$wo->query("SELECT * FROM Wo_Events ORDER BY id ASC");$c=0;
-        while($e=$result->fetch_assoc()){
+        zk_q($sn,"DELETE FROM events WHERE event_id > 0");
+        $c=0;
+        foreach (zk_rows($wo, "SELECT * FROM Wo_Events ORDER BY id ASC") as $e) {
             $sd=($e['start_date']&&$e['start_date']!='0000-00-00')?$e['start_date']:date('Y-m-d');
             $ed=($e['end_date']&&$e['end_date']!='0000-00-00')?$e['end_date']:date('Y-m-d');
             $st=(!empty($e['start_time'])&&$e['start_time']!='00:00:00')?$e['start_time']:'12:00:00';
             $et=(!empty($e['end_time'])&&$e['end_time']!='00:00:00')?$e['end_time']:'23:59:59';
             $cover = zk_fix_path($e['cover'] ?? '');
-            if($sn->query("INSERT INTO events (event_id,event_admin,event_category,event_title,event_description,event_location,event_start_date,event_end_date,event_cover,event_country,event_language,event_date) VALUES ({$e['id']},".(int)($e['poster_id']??0).",1,'".zk_esc($sn,$e['name'])."','".zk_esc($sn,$e['description'])."','".zk_esc($sn,$e['location'])."','".zk_esc($sn,"$sd $st")."','".zk_esc($sn,"$ed $et")."','".zk_esc($sn,$cover)."',0,0,NOW())"))$c++;
+            // event_date is the creation time: taken from WoWonder when it has one, otherwise the run time.
+            $created=isset($e['time'])?"'".zk_ts($e['time'])."'":'NOW()';
+            $c+=zk_q($sn,"INSERT INTO events (event_id,event_admin,event_category,event_title,event_description,event_location,event_start_date,event_end_date,event_cover,event_country,event_language,event_date) VALUES (".(int)$e['id'].",".$U($e['poster_id']??0).",1,'".zk_esc($sn,$e['name'])."','".zk_esc($sn,$e['description'])."','".zk_esc($sn,$e['location'])."','".zk_esc($sn,"$sd $st")."','".zk_esc($sn,"$ed $et")."','".zk_esc($sn,$cover)."',0,0,$created)");
         }
         $stats['Events']=$c;
         zk_out("  $c events",'ok');
@@ -440,11 +495,13 @@ function zk_run_migration($_MIGRATION_STEPS, $_WO_CONFIG, $_SN_CONFIG) {
     if (in_array('products', $_MIGRATION_STEPS)) {
         $step_num++;
         zk_out("[$step_num/$total_steps] Migrating Products...", 'info');
-        $result=$wo->query("SELECT * FROM Wo_Products ORDER BY id ASC");$c=0;
-        while($pr=$result->fetch_assoc()){
-            $uid=(int)$pr['user_id'];$n=zk_esc($sn,$pr['name']??'');$d=zk_esc($sn,$pr['description']??'');
-            if($sn->query("INSERT INTO posts (user_id,user_type,post_type,text,time,privacy) VALUES ($uid,'user','product','$n - $d','".zk_ts($pr['time']??0)."','public')")){
-                $pid=$sn->insert_id;$sn->query("INSERT INTO posts_products (post_id,name,category_id,status,price,location) VALUES ($pid,'$n',0,'new',".(float)($pr['price']??0).",'".zk_esc($sn,$pr['location']??'')."')");$c++;
+        // Clear products from an earlier run so a rerun does not duplicate them.
+        zk_q($sn,"DELETE FROM posts WHERE post_type='product'");zk_q($sn,"TRUNCATE TABLE posts_products");
+        $c=0;
+        foreach (zk_rows($wo, "SELECT * FROM Wo_Products ORDER BY id ASC") as $pr) {
+            $uid=$U($pr['user_id']);$n=zk_esc($sn,$pr['name']??'');$d=zk_esc($sn,$pr['description']??'');
+            if(zk_q($sn,"INSERT INTO posts (user_id,user_type,post_type,text,time,privacy) VALUES ($uid,'user','product','$n - $d','".zk_ts($pr['time']??0)."','public')")){
+                $pid=$sn->insert_id;$c+=zk_q($sn,"INSERT INTO posts_products (post_id,name,category_id,status,price,location) VALUES ($pid,'$n',0,'new',".(float)($pr['price']??0).",'".zk_esc($sn,$pr['location']??'')."')");
             }
         }
         $stats['Products']=$c;
@@ -455,12 +512,15 @@ function zk_run_migration($_MIGRATION_STEPS, $_WO_CONFIG, $_SN_CONFIG) {
     if (in_array('blogs', $_MIGRATION_STEPS)) {
         $step_num++;
         zk_out("[$step_num/$total_steps] Migrating Blogs...", 'info');
-        $result=$wo->query("SELECT * FROM Wo_Blog ORDER BY id ASC");$c=0;
-        while($b=$result->fetch_assoc()){
+        // Clear articles from an earlier run so a rerun does not duplicate them.
+        zk_q($sn,"DELETE FROM posts WHERE post_type='article'");zk_q($sn,"TRUNCATE TABLE posts_articles");
+        $c=0;
+        foreach (zk_rows($wo, "SELECT * FROM Wo_Blog ORDER BY id ASC") as $b) {
             $uid=(int)($b['user']??0);if($uid<=0)continue;
+            $uid=$U($uid);
             $thumb = zk_fix_path($b['thumbnail'] ?? '');
-            if($sn->query("INSERT INTO posts (user_id,user_type,post_type,text,time,privacy) VALUES ($uid,'user','article','".zk_esc($sn,$b['title']??'')."','".zk_ts($b['posted']??0)."','public')")){
-                $pid=$sn->insert_id;$sn->query("INSERT INTO posts_articles (post_id,cover,title,text,category_id) VALUES ($pid,'".zk_esc($sn,$thumb)."','".zk_esc($sn,$b['title']??'')."','".zk_esc($sn,$b['content']??'')."',0)");$c++;
+            if(zk_q($sn,"INSERT INTO posts (user_id,user_type,post_type,text,time,privacy) VALUES ($uid,'user','article','".zk_esc($sn,$b['title']??'')."','".zk_ts($b['posted']??0)."','public')")){
+                $pid=$sn->insert_id;$c+=zk_q($sn,"INSERT INTO posts_articles (post_id,cover,title,text,category_id) VALUES ($pid,'".zk_esc($sn,$thumb)."','".zk_esc($sn,$b['title']??'')."','".zk_esc($sn,$b['content']??'')."',0)");
             }
         }
         $stats['Blogs']=$c;
@@ -471,9 +531,9 @@ function zk_run_migration($_MIGRATION_STEPS, $_WO_CONFIG, $_SN_CONFIG) {
     if (in_array('pokes', $_MIGRATION_STEPS)) {
         $step_num++;
         zk_out("[$step_num/$total_steps] Migrating Pokes...", 'info');
-        $sn->query("TRUNCATE TABLE users_pokes");
-        $result=$wo->query("SELECT * FROM Wo_Pokes");$c=0;
-        while($pk=$result->fetch_assoc()){$s=(int)($pk['send_user_id']??0);$r=(int)($pk['received_user_id']??0);if($s>0&&$r>0){$sn->query("INSERT IGNORE INTO users_pokes (user_id,poked_id) VALUES ($s,$r)");$c++;}}
+        zk_q($sn,"TRUNCATE TABLE users_pokes");
+        $c=0;
+        foreach (zk_rows($wo, "SELECT * FROM Wo_Pokes") as $pk) {$s=(int)($pk['send_user_id']??0);$r=(int)($pk['received_user_id']??0);if($s>0&&$r>0)$c+=zk_q($sn,"INSERT IGNORE INTO users_pokes (user_id,poked_id) VALUES (".$U($s).",".$U($r).")");}
         $stats['Pokes']=$c;
         zk_out("  $c pokes",'ok');
     }
@@ -481,11 +541,12 @@ function zk_run_migration($_MIGRATION_STEPS, $_WO_CONFIG, $_SN_CONFIG) {
     // ====== UPDATE COUNTERS ======
     $step_num++;
     zk_out("\n[$step_num/$total_steps] Updating counters & final cleanup...", 'info');
-    $sn->query("UPDATE pages p SET page_likes=(SELECT COUNT(*) FROM pages_likes pl WHERE pl.page_id=p.page_id)");
-    $sn->query("UPDATE `groups` g SET group_members=(SELECT COUNT(*) FROM groups_members gm WHERE gm.group_id=g.group_id)");
-    $sn->query("UPDATE posts_comments c INNER JOIN (SELECT node_id,COUNT(*) as cnt FROM posts_comments WHERE node_type='comment' GROUP BY node_id) r ON c.comment_id=r.node_id SET c.replies=r.cnt");
+    zk_q($sn,"UPDATE pages p SET page_likes=(SELECT COUNT(*) FROM pages_likes pl WHERE pl.page_id=p.page_id)");
+    zk_q($sn,"UPDATE `groups` g SET group_members=(SELECT COUNT(*) FROM groups_members gm WHERE gm.group_id=g.group_id)");
+    zk_q($sn,"UPDATE posts_comments c INNER JOIN (SELECT node_id,COUNT(*) as cnt FROM posts_comments WHERE node_type='comment' GROUP BY node_id) r ON c.comment_id=r.node_id SET c.replies=r.cnt");
     $sn->query("SET FOREIGN_KEY_CHECKS = 1");
     zk_out("  Done", 'ok');
+    if ($zk_failed) $stats['Rows skipped (errors)'] = $zk_failed;
 
     // ====== SUMMARY ======
     echo "</div><div class='summary'><h2>Migration Complete!</h2><table>";
@@ -543,15 +604,14 @@ body{font-family:'Courier New',monospace;background:#0a0e1a;color:#c9d1d9;paddin
     ob_implicit_flush(true);
     if (ob_get_level()) ob_end_flush();
 
-    $steps = [];
-    $step_names = ['users','followers','pages','groups','posts','reactions','comments','messages','hashtags','blocks','saved_posts','events','products','blogs','pokes'];
+    // Users are required by every other step, so they always run (the checkbox cannot be unchecked).
+    $steps = ['users'];
+    $step_names = ['followers','pages','groups','posts','reactions','comments','messages','hashtags','blocks','saved_posts','events','products','blogs','pokes'];
     foreach ($step_names as $s) {
         if (isset($_POST['migrate_' . $s])) $steps[] = $s;
     }
 
-    if (empty($steps)) {
-        echo "<span class='err'>No data types selected. Go back and select what to migrate.</span>\n";
-    } else {
+    {
         // Validate inputs
         $required = ['wo_host','wo_port','wo_user','wo_db','sn_host','sn_port','sn_user','sn_db'];
         $missing = [];
@@ -652,7 +712,7 @@ if (isset($_POST['test_connection'])) {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>WoWonder to Sngine Migration | ZeronKit</title>
+<title>WoWonder to Sngine Migration v<?= ZERONKIT_VERSION ?> | ZeronKit</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0e1a;color:#c9d1d9;min-height:100vh}
@@ -742,7 +802,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
         <div class="card">
             <h2>What to Migrate <span class="badge badge-blue">Select</span></h2>
             <div class="checks">
-                <label class="check"><input type="checkbox" name="migrate_users" checked> Users & Passwords <span class="info">Required</span></label>
+                <label class="check"><input type="checkbox" checked disabled> Users & Passwords <span class="info">Required</span><input type="hidden" name="migrate_users" value="on"></label>
                 <label class="check"><input type="checkbox" name="migrate_followers" checked> Followers & Friends</label>
                 <label class="check"><input type="checkbox" name="migrate_posts" checked> Posts & Media</label>
                 <label class="check"><input type="checkbox" name="migrate_comments" checked> Comments & Replies</label>
@@ -772,7 +832,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
             </button>
         </div>
     </form>
-    <div class="footer"><a href="<?= ZERONKIT_SITE ?>" target="_blank">zeronkit.com</a>: Free open-source migration tools</div>
+    <div class="footer"><a href="<?= ZERONKIT_SITE ?>" target="_blank">zeronkit.com</a>: Free open-source migration tools | v<?= ZERONKIT_VERSION ?></div>
 </div>
 <script>
 function hideAlerts(){document.getElementById('alertError').style.display='none';document.getElementById('alertSuccess').style.display='none'}

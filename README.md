@@ -21,7 +21,29 @@ Full step by step guides:
 - [WoWonder to Sngine guide](https://zeronkit.com/wowonder-to-sngine/)
 - [WoWonder to SocialEngine guide](https://zeronkit.com/wowonder-to-socialengine/)
 
-Requires PHP with the mysqli extension and access to both databases.
+Requires PHP 7.4 or newer (PHP 8.x works) with the mysqli extension and access to both databases.
+
+## Good to know
+
+- **Your admin account stays as it is.** The admin you made when installing the target keeps user id 1, its username, email and password. WoWonder's own user 1 is moved to the first free id after your last WoWonder user, together with all of its posts, comments, messages and follows. If WoWonder user 1 has the same username or email as your admin, it is treated as the same person: no second account is made and its content goes to your admin. The progress screen says which of the two happened.
+- **Running it again is safe.** Each step clears what it moved last time before it moves it again, so nothing is doubled.
+- **Errors do not stop the run.** If one row cannot be written (for example two WoWonder users share an email), the tool shows the database error, skips that row and carries on. A wrong database login stops the run straight away with a clear message, before anything is changed.
+- **The numbers at the end are real.** They count the rows actually written, not the rows tried.
+- **Dates come from WoWonder.** Join dates, post, comment, message, product, blog and follow dates are kept. Only where WoWonder has no date (for example reactions, or a date of 0) is the time of the migration used.
+
+## Changelog
+
+**2.1**
+- WoWonder user 1 no longer takes over the target admin account. It is migrated as a normal user, or merged into the admin when it is the same person, with a notice.
+- Dates are taken from WoWonder wherever it has them (last seen in Sngine, conversation dates in SocialEngine).
+- End of run numbers show rows really written.
+- Works on PHP 8.1 and newer without fatal errors: a wrong login gives a clear message, a failing row is shown and skipped.
+- Products and blog articles are cleared before they are moved again, so a rerun does not duplicate them.
+- Empty values (such as video views) no longer break the posts step.
+- Users are always migrated (the option cannot be switched off), and the SocialEngine tool now checks that all required fields are filled in.
+
+**2.0**
+- First open source release: one self-contained file per tool, no licence key, no network calls.
 
 ## Licence
 
