@@ -38,7 +38,7 @@
  *  NOTE: Users keep their existing passwords. SocialEngine supports
  *        bcrypt hashes natively when password length > 32 characters.
  *
- *  SUPPORT: contact@zeronkit.com
+ *  SUPPORT: info@zeronkit.com
  */
 
 define('ZERONKIT_VERSION', '2.1');

@@ -34,7 +34,7 @@
  *  - PHP extension: mysqli
  *  - Access to both WoWonder and Sngine databases
  *
- *  SUPPORT: contact@zeronkit.com
+ *  SUPPORT: info@zeronkit.com
  */
 
 define('ZERONKIT_VERSION', '2.1');
@@ -62,7 +62,7 @@ if (!empty($errors)) {
     echo '.help{margin-top:24px;color:#6b7280;font-size:.85rem}.help a{color:#3b82f6;text-decoration:none}';
     echo '</style></head><body><div class="card"><h1>System Check Failed</h1><p class="sub">Your server is missing requirements needed to run this tool.</p>';
     foreach ($errors as $e) echo '<div class="err">' . htmlspecialchars($e) . '</div>';
-    echo '<div class="help">Need help? Visit <a href="' . ZERONKIT_SITE . '">zeronkit.com</a> or email <a href="mailto:contact@zeronkit.com">contact@zeronkit.com</a></div>';
+    echo '<div class="help">Need help? Visit <a href="' . ZERONKIT_SITE . '">zeronkit.com</a> or email <a href="mailto:info@zeronkit.com">info@zeronkit.com</a></div>';
     echo '</div></body></html>';
     exit;
 }
